@@ -115,6 +115,25 @@ class ScanBatchCreate(BaseModel):
     scans: list[ScanCreate] = Field(..., min_length=1)
 
 
+class PointClockOffsetIn(BaseModel):
+    """Signed integer seconds offset for one point's device clock."""
+
+    offset_seconds: int
+
+    @field_validator("offset_seconds", mode="before")
+    @classmethod
+    def _strict_integer(cls, v):
+        # bool is a subclass of int; reject it along with every non-int
+        # (notably 1.5 and even 5.0) so non-integer offsets get an explicit
+        # 422 instead of being silently truncated.
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(
+                "offset_seconds must be an integer number of seconds "
+                "(fractional/non-integer values are rejected)"
+            )
+        return v
+
+
 # --------------------------------------------------------------------------
 # Outputs
 # --------------------------------------------------------------------------
@@ -161,8 +180,10 @@ class UsedScanOut(BaseModel):
     segment: int
     point: str
     scan_no: str
-    occurred_at: datetime
-    segment_seconds: float
+    occurred_at: datetime  # original, unmodified observation instant
+    offset_seconds: int  # point clock offset applied
+    calibrated_at: datetime  # occurred_at + offset_seconds
+    segment_seconds: float  # measured between calibrated instants
 
 
 class RunnerResultOut(BaseModel):
@@ -175,6 +196,40 @@ class RunnerResultOut(BaseModel):
     total_seconds: Optional[float]
     rank: Optional[int]
     used_scans: list[UsedScanOut]
+
+
+class PointClockOffsetOut(BaseModel):
+    position: int
+    point: str
+    offset_seconds: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class PointClockOffsetSingleOut(BaseModel):
+    race_id: str
+    point: str
+    position: int
+    offset_seconds: int
+    replaced: bool = False
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class PointClockOffsetListOut(BaseModel):
+    race_id: str
+    sealed: bool
+    sealed_at: Optional[datetime]
+    offsets: list[PointClockOffsetOut]
+
+
+class ResultsEnvelopeOut(BaseModel):
+    race_id: str
+    name: str
+    sealed: bool
+    sealed_at: Optional[datetime]
+    clock_offsets: list[PointClockOffsetOut]
+    results: list[RunnerResultOut]
 
 
 class ScanOut(BaseModel):

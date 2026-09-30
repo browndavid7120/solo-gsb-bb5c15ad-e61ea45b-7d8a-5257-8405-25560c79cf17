@@ -13,8 +13,12 @@ from . import service
 from .database import SessionLocal, init_db
 from .schemas import (
     ErrorBody,
+    PointClockOffsetIn,
+    PointClockOffsetListOut,
+    PointClockOffsetSingleOut,
     RaceCreate,
     RaceOut,
+    ResultsEnvelopeOut,
     RunnerResultOut,
     ScanBatchCreate,
     ScanBatchItem,
@@ -33,12 +37,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Road Race Split Timing Adjudication Service",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "Race configuration, out-of-order chip scan ingestion with "
-        "idempotent replay/conflict detection, provisional results, scan "
-        "revocation and sealing of a frozen result snapshot."
+        "idempotent replay/conflict detection, per-point signed integer "
+        "clock offsets with calibrated adjudication, provisional results, "
+        "scan revocation and sealing of a frozen result snapshot."
     ),
 )
 
@@ -144,11 +149,56 @@ def revoke_scan(
 
 
 # --------------------------------------------------------------------------
+# Point clock offsets
+# --------------------------------------------------------------------------
+
+
+@app.put(
+    "/races/{race_id}/points/{point_code}/offset",
+    response_model=PointClockOffsetSingleOut,
+    tags=["clock-offsets"],
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def set_point_offset(
+    race_id: str,
+    point_code: str,
+    payload: PointClockOffsetIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    return service.set_point_offset(db, race_id, point_code, payload)
+
+
+@app.get(
+    "/races/{race_id}/points/{point_code}/offset",
+    response_model=PointClockOffsetSingleOut,
+    tags=["clock-offsets"],
+    responses={404: {"model": ErrorBody}},
+)
+def get_point_offset(
+    race_id: str, point_code: str, db: Session = Depends(get_db)
+) -> dict:
+    return service.get_point_offset(db, race_id, point_code)
+
+
+@app.get(
+    "/races/{race_id}/offsets",
+    response_model=PointClockOffsetListOut,
+    tags=["clock-offsets"],
+)
+def list_point_offsets(race_id: str, db: Session = Depends(get_db)) -> dict:
+    return service.list_point_offsets(db, race_id)
+
+
+# --------------------------------------------------------------------------
 # Results & sealing
 # --------------------------------------------------------------------------
 
 
-@app.get("/races/{race_id}/results", tags=["results"])
+@app.get(
+    "/races/{race_id}/results",
+    response_model=ResultsEnvelopeOut,
+    tags=["results"],
+)
 def race_results(race_id: str, db: Session = Depends(get_db)) -> dict:
     return service.live_results(db, race_id)
 
@@ -164,6 +214,10 @@ def runner_result(
     return service.runner_result(db, race_id, runner_id)
 
 
-@app.post("/races/{race_id}/seal", tags=["results"])
+@app.post(
+    "/races/{race_id}/seal",
+    response_model=ResultsEnvelopeOut,
+    tags=["results"],
+)
 def seal_race(race_id: str, db: Session = Depends(get_db)) -> dict:
     return service.seal_race(db, race_id)

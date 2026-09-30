@@ -15,8 +15,17 @@ from sqlalchemy.orm import Session, selectinload
 from .adjudication import Scan as DomainScan
 from .adjudication import Segment as DomainSegment
 from .adjudication import adjudicate_runner
-from .database import Point, Race, ResultSnapshot, Runner, Scan, SegmentRow, utcnow
-from .schemas import RaceCreate, ScanCreate
+from .database import (
+    Point,
+    PointClockOffset,
+    Race,
+    ResultSnapshot,
+    Runner,
+    Scan,
+    SegmentRow,
+    utcnow,
+)
+from .schemas import PointClockOffsetIn, RaceCreate, ScanCreate
 
 
 class ApiError(Exception):
@@ -219,6 +228,146 @@ def get_race(db: Session, race_id: str) -> Race:
     if race is None:
         raise ApiError(404, "race_not_found", f"race {race_id} does not exist")
     return race
+
+
+# --------------------------------------------------------------------------
+# Point clock offsets
+# --------------------------------------------------------------------------
+
+
+def _get_point_or_404(db: Session, race: Race, point_code: str) -> Point:
+    point = db.scalars(
+        select(Point).where(
+            Point.race_id == race.id, Point.code == point_code
+        )
+    ).first()
+    if point is None:
+        raise ApiError(
+            404, "unknown_point",
+            f"point {point_code!r} does not exist in this race",
+        )
+    return point
+
+
+def _offset_by_point_id(db: Session, race: Race) -> dict[int, PointClockOffset]:
+    return {
+        row.point_id: row
+        for row in db.scalars(
+            select(PointClockOffset).where(PointClockOffset.race_id == race.id)
+        ).all()
+    }
+
+
+def _offsets_view(
+    race: Race,
+    points: list[Point],
+    rows: dict[int, PointClockOffset] | list[PointClockOffset],
+) -> list[dict]:
+    """Serializable current offset version, ordered by point position.
+
+    ``rows`` is either the mapping used during adjudication or the race's
+    loaded relationship; points without a configured row read as zero but
+    are omitted here (unset == zero, and the view only lists settings).
+    """
+
+    if isinstance(rows, dict):
+        by_id = rows
+    else:
+        by_id = {r.point_id: r for r in rows}
+    view: list[dict] = []
+    for point in points:
+        row = by_id.get(point.id)
+        if row is None:
+            continue
+        view.append(
+            {
+                "position": point.position,
+                "point": point.code,
+                "offset_seconds": int(row.offset_seconds),
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+        )
+    return view
+
+
+def set_point_offset(
+    db: Session, race_id: str, point_code: str, payload: PointClockOffsetIn
+) -> dict:
+    """Set or replace the signed integer offset of one point's clock.
+
+    Serialised against scan submission/revocation/sealing by the race row
+    lock; rejected after sealing. Provisional results are recomputed on the
+    next query from the same committed scans plus this new offset version.
+    """
+
+    race = get_race_locked(db, race_id)
+    if race.sealed:
+        raise ApiError(409, "race_sealed",
+                       "race is sealed; clock offsets cannot be changed")
+
+    point = _get_point_or_404(db, race, point_code)
+
+    row = db.scalars(
+        select(PointClockOffset).where(
+            PointClockOffset.race_id == race.id,
+            PointClockOffset.point_id == point.id,
+        )
+    ).first()
+    now = utcnow()
+    replaced = row is not None
+    if row is None:
+        row = PointClockOffset(
+            race_id=race.id,
+            point_id=point.id,
+            offset_seconds=payload.offset_seconds,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+    else:
+        row.offset_seconds = payload.offset_seconds
+        row.updated_at = now
+    db.commit()
+    db.refresh(row)
+    return {
+        "race_id": str(race.id),
+        "point": point.code,
+        "position": point.position,
+        "offset_seconds": int(row.offset_seconds),
+        "replaced": replaced,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def list_point_offsets(db: Session, race_id: str) -> dict:
+    race = get_race(db, race_id)
+    points = sorted(race.points, key=lambda p: p.position)
+    return {
+        "race_id": str(race.id),
+        "sealed": race.sealed,
+        "sealed_at": race.sealed_at,
+        "offsets": _offsets_view(race, points, race.clock_offsets),
+    }
+
+
+def get_point_offset(db: Session, race_id: str, point_code: str) -> dict:
+    race = get_race(db, race_id)
+    point = _get_point_or_404(db, race, point_code)
+    row = next(
+        (r for r in race.clock_offsets if r.point_id == point.id), None
+    )
+    return {
+        "race_id": str(race.id),
+        "point": point.code,
+        "position": point.position,
+        # Unset offsets read as zero.
+        "offset_seconds": int(row.offset_seconds) if row is not None else 0,
+        "replaced": False,
+        "created_at": row.created_at if row is not None else None,
+        "updated_at": row.updated_at if row is not None else None,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -456,6 +605,7 @@ def revoke_scan(db: Session, race_id: str, scan_no: str) -> Scan:
 def _runner_results(
     db: Session,
     race: Race,
+    offset_rows: dict[int, PointClockOffset] | None = None,
 ) -> list[dict]:
     points = sorted(race.points, key=lambda p: p.position)
     point_by_id = {p.id: p for p in points}
@@ -475,6 +625,10 @@ def _runner_results(
         .order_by(Scan.occurred_at, Scan.scan_no)
     ).all()
 
+    # Current offset version for every point (unset points read zero).
+    if offset_rows is None:
+        offset_rows = _offset_by_point_id(db, race)
+
     by_runner: dict[str, list[Scan]] = {}
     for scan in active_scans:
         by_runner.setdefault(scan.runner_id, []).append(scan)
@@ -488,6 +642,11 @@ def _runner_results(
                 scan_no=s.scan_no,
                 point_position=position_by_id[s.point_id],
                 occurred_at=s.occurred_at,
+                offset_seconds=int(
+                    offset_rows[s.point_id].offset_seconds
+                    if s.point_id in offset_rows
+                    else 0
+                ),
             )
             for s in runner_scans
         ]
@@ -503,6 +662,8 @@ def _runner_results(
                 "point": point_by_scan_no[u.scan_no].code,
                 "scan_no": u.scan_no,
                 "occurred_at": u.occurred_at,
+                "offset_seconds": u.offset_seconds,
+                "calibrated_at": u.calibrated_at,
                 "segment_seconds": u.segment_seconds,
             }
             for u in result.used_scans
@@ -544,17 +705,37 @@ def _runner_results(
     return ordered
 
 
+def _results_envelope(
+    race: Race,
+    points: list[Point],
+    offset_rows: dict[int, PointClockOffset],
+    *,
+    sealed: bool,
+    results: list[dict],
+) -> dict:
+    return {
+        "race_id": str(race.id),
+        "name": race.name,
+        "sealed": sealed,
+        "sealed_at": race.sealed_at if sealed else None,
+        "clock_offsets": _offsets_view(race, points, offset_rows),
+        "results": results,
+    }
+
+
 def live_results(db: Session, race_id: str) -> dict:
     race = get_race(db, race_id)
     if race.sealed:
         return sealed_results_payload(db, race)
-    return {
-        "race_id": str(race.id),
-        "name": race.name,
-        "sealed": False,
-        "sealed_at": None,
-        "results": _runner_results(db, race),
-    }
+    points = sorted(race.points, key=lambda p: p.position)
+    offset_rows = _offset_by_point_id(db, race)
+    return _results_envelope(
+        race,
+        points,
+        offset_rows,
+        sealed=False,
+        results=_runner_results(db, race, offset_rows),
+    )
 
 
 def runner_result(db: Session, race_id: str, runner_id: str) -> dict:
@@ -563,13 +744,15 @@ def runner_result(db: Session, race_id: str, runner_id: str) -> dict:
     if race.sealed:
         payload = sealed_results_payload(db, race)
     else:
-        payload = {
-            "race_id": str(race.id),
-            "name": race.name,
-            "sealed": False,
-            "sealed_at": None,
-            "results": _runner_results(db, race),
-        }
+        points = sorted(race.points, key=lambda p: p.position)
+        offset_rows = _offset_by_point_id(db, race)
+        payload = _results_envelope(
+            race,
+            points,
+            offset_rows,
+            sealed=False,
+            results=_runner_results(db, race, offset_rows),
+        )
     for item in payload["results"]:
         if item["runner_id"] == runner_id:
             return item
@@ -589,7 +772,9 @@ def seal_race(db: Session, race_id: str) -> dict:
     if race.sealed:
         return sealed_results_payload(db, race)
 
-    results = _runner_results(db, race)
+    points = sorted(race.points, key=lambda p: p.position)
+    offset_rows = _offset_by_point_id(db, race)
+    results = _runner_results(db, race, offset_rows)
     sealed_at = utcnow()
     race.sealed = True
     race.sealed_at = sealed_at
@@ -602,13 +787,11 @@ def seal_race(db: Session, race_id: str) -> dict:
             )
         )
     db.commit()
-    return {
-        "race_id": str(race.id),
-        "name": race.name,
-        "sealed": True,
-        "sealed_at": sealed_at,
-        "results": _json_safe(results),
-    }
+    return _json_safe(
+        _results_envelope(
+            race, points, offset_rows, sealed=True, results=results
+        )
+    )
 
 
 def sealed_results_payload(db: Session, race: Race) -> dict:
@@ -618,10 +801,12 @@ def sealed_results_payload(db: Session, race: Race) -> dict:
         .order_by(ResultSnapshot.id)
     ).all()
     payloads = [row.payload for row in rows]
-    return {
-        "race_id": str(race.id),
-        "name": race.name,
-        "sealed": True,
-        "sealed_at": race.sealed_at,
-        "results": payloads,
-    }
+    points = sorted(race.points, key=lambda p: p.position)
+    # After sealing no offset row can change; the committed rows describe the
+    # exact version captured by the frozen per-runner snapshots.
+    offset_rows = _offset_by_point_id(db, race)
+    return _json_safe(
+        _results_envelope(
+            race, points, offset_rows, sealed=True, results=payloads
+        )
+    )

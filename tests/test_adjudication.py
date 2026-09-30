@@ -28,11 +28,12 @@ def segments(minutes):
     ]
 
 
-def sc(no, pos, minute, second=0):
+def sc(no, pos, minute, second=0, offset=0):
     return Scan(
         scan_no=no,
         point_position=pos,
         occurred_at=T0 + timedelta(minutes=minute, seconds=second),
+        offset_seconds=offset,
     )
 
 
@@ -155,6 +156,118 @@ def test_irrelevant_point_scans_ignored():
     scans = [sc("1", 1, 10), sc("x", 5, 12), sc("2", 2, 20)]
     r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
     check("ignore", [u.scan_no for u in r.used_scans], ["1", "2"])
+
+
+# --------------------------------------------------------------------------
+# Point clock offsets: adjudication runs on occurred_at + offset_seconds
+# --------------------------------------------------------------------------
+
+
+def test_positive_offset_pushes_scan_later():
+    # Raw C1 at 4 min is below the 5-minute minimum; +120s calibrates it to
+    # 6 minutes, inside [5,30]; FIN at 20 raw -> calibrated 22, still valid.
+    segs = segments([(5, 30), (5, 30)])
+    scans = [sc("1", 1, 4, offset=120), sc("2", 2, 20, offset=120)]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("offset finish", r.status, "finished")
+    check("offset finish time", r.finish_time,
+          T0 + timedelta(minutes=20, seconds=120))
+    check("offset total", r.total_seconds, 20 * 60 + 120)
+    check("segment secs calibrated",
+          [u.segment_seconds for u in r.used_scans], [360.0, 960.0])
+    # Original stamps are preserved alongside the calibrated ones.
+    check("original kept", r.used_scans[0].occurred_at,
+          T0 + timedelta(minutes=4))
+    check("calibrated kept", r.used_scans[0].calibrated_at,
+          T0 + timedelta(minutes=6))
+    check("offset echoed", [u.offset_seconds for u in r.used_scans], [120, 120])
+
+
+def test_negative_offset_pulls_scan_earlier():
+    # Raw C1 at 6 min passes the minimum; -120s calibrates it to 4 minutes,
+    # below the 5-minute lower bound -> DNF.
+    segs = segments([(5, 30), (5, 30)])
+    scans = [sc("1", 1, 6, offset=-120), sc("2", 2, 20, offset=-120)]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("negative offset dnf", r.status, "did_not_finish")
+
+
+def test_strict_increase_uses_calibrated_times():
+    # Both scans are stamped at the same raw minute 10, but different point
+    # offsets make calibrated C1 = 10:00 and calibrated C2 = 10:30, which is
+    # a strict increase; with zero offsets the equal stamps would be DNF.
+    segs = segments([(5, 40), (0, 40)])
+    scans = [sc("1", 1, 10, offset=0), sc("2", 2, 10, offset=30)]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("cross-point calibrated increase", r.status, "finished")
+    check("cross-point gap", r.used_scans[1].segment_seconds, 30.0)
+
+    # Reverse: raw C1(10) -> raw C2(12) looks ordered, but offsets calibrate
+    # C1 to 11:00 and C2 to 11:30? no — calibrate C1 to 12:30 (+150s) while
+    # C2 stays at 12:00, so the calibrated C2 precedes C1 -> DNF.
+    scans = [sc("1", 1, 10, offset=150), sc("2", 2, 12, offset=0)]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("calibrated inversion dnf", r.status, "did_not_finish")
+
+
+def test_cutoff_checked_on_calibrated_finish():
+    # Raw FIN at 58 minutes passes the 60-minute cutoff, but +300s pushes the
+    # calibrated instant to 1:03 -> after cutoff -> DNF.
+    segs = segments([(5, 60), (5, 60)])
+    scans = [sc("1", 1, 20), sc("2", 2, 58, offset=300)]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("positive offset past cutoff dnf", r.status, "did_not_finish")
+
+    # Raw FIN at 61 minutes is too late, but -120s calibrates it to 60:00
+    # exactly -> "not later than cutoff" -> finished at the calibrated time.
+    scans = [sc("1", 1, 20), sc("2", 2, 61, offset=-60)]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("negative offset to cutoff finishes", r.status, "finished")
+    check("calibrated finish at cutoff", r.finish_time, CUTOFF)
+    check("raw finish preserved", r.used_scans[1].occurred_at,
+          T0 + timedelta(minutes=61))
+
+
+def test_offset_changes_earliest_finish_choice():
+    # Both FIN scans share the finish-point offset of -420s at one moment:
+    #   a1(C1 raw 10) -> b2(FIN raw 25 -> cal 18): 8-minute gap, valid
+    #   b1(C1 raw 15) -> b2(FIN cal 18): 3-minute gap, below the 5-min min
+    # so the earliest calibrated finish is the cross path a1->b2 at 18.
+    segs = segments([(5, 40), (5, 40)])
+    scans = [
+        sc("a1", 1, 10), sc("a2", 2, 30, offset=-420),
+        sc("b1", 1, 15), sc("b2", 2, 25, offset=-420),
+    ]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("offset cross path earliest", [u.scan_no for u in r.used_scans],
+          ["a1", "b2"])
+    check("offset cross finish", r.finish_time, T0 + timedelta(minutes=18))
+
+    # After the finish clock is replaced (b2 now observed with offset 0),
+    # a1->a2 (cal 23) beats a1->b2 (raw 25).
+    scans = [
+        sc("a1", 1, 10), sc("a2", 2, 30, offset=-420),
+        sc("b1", 1, 15), sc("b2", 2, 25, offset=0),
+    ]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("offset reorders winner", [u.scan_no for u in r.used_scans],
+          ["a1", "a2"])
+    check("calibrated winner finish", r.finish_time,
+          T0 + timedelta(minutes=23))
+
+
+def test_unset_offset_defaults_to_zero():
+    segs = segments([(5, 30), (5, 30)])
+    scan1 = Scan("1", 1, T0 + timedelta(minutes=10))
+    scan2 = Scan("2", 2, T0 + timedelta(minutes=20))
+    r = adjudicate_runner(
+        race_start=T0, cutoff=CUTOFF, segments=segs, scans=[scan1, scan2]
+    )
+    check("default zero finish", r.status, "finished")
+    check("default zero echoed",
+          [u.offset_seconds for u in r.used_scans], [0, 0])
+    check("default calibrated equals raw",
+          r.used_scans[0].calibrated_at, scan1.occurred_at)
 
 
 def _run_all():

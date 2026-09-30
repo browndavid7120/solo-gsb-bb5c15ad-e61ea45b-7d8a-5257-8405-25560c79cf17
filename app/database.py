@@ -82,6 +82,9 @@ class Race(Base):
     snapshots: Mapped[list["ResultSnapshot"]] = relationship(
         back_populates="race", cascade="all, delete-orphan"
     )
+    clock_offsets: Mapped[list["PointClockOffset"]] = relationship(
+        back_populates="race", cascade="all, delete-orphan"
+    )
 
 
 class Point(Base):
@@ -104,9 +107,44 @@ class Point(Base):
     )
 
 
+class PointClockOffset(Base):
+    """Signed integer seconds clock offset for one point of one race.
+
+    Only explicitly configured offsets have a row; a missing row means an
+    offset of zero. The calibrated instant of a scan is
+    ``occurred_at + offset_seconds``. Replacing the value recomputes every
+    provisional result; the table is frozen alongside the race on sealing.
+    """
+
+    __tablename__ = "point_clock_offsets"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    race_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("races.id", ondelete="CASCADE"), nullable=False
+    )
+    point_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("race_points.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    offset_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    race: Mapped[Race] = relationship(back_populates="clock_offsets")
+    point: Mapped[Point] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("race_id", "point_id", name="uq_offset_race_point"),
+    )
+
+
 class SegmentRow(Base):
     __tablename__ = "segments"
-
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     race_id: Mapped[str] = mapped_column(
         UUID(as_uuid=False), ForeignKey("races.id", ondelete="CASCADE"), nullable=False

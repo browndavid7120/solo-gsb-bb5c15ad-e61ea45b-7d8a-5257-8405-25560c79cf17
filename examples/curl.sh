@@ -38,26 +38,44 @@ echo "$RACE_JSON"
 RACE_ID=$(echo "$RACE_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 
 echo "## submit scans out of order (FIN first)"
+# C1 stamped at 5 minutes, FIN at 40 minutes: the second leg is 35 minutes,
+# above the 1800s (30m) segment max, so without a clock offset the runner
+# provisionally does not finish.
 curl -fsS -X POST "$BASE_URL/races/$RACE_ID/scans" -H 'Content-Type: application/json' \
-  -d "{\"scan_no\":\"S2\",\"chip\":\"CHIP-A\",\"point\":\"FIN\",\"occurred_at\":\"$(AT 1800)\"}"; echo
+  -d "{\"scan_no\":\"S2\",\"chip\":\"CHIP-A\",\"point\":\"FIN\",\"occurred_at\":\"$(AT 2400)\"}"; echo
 curl -fsS -X POST "$BASE_URL/races/$RACE_ID/scans" -H 'Content-Type: application/json' \
-  -d "{\"scan_no\":\"S1\",\"chip\":\"CHIP-A\",\"point\":\"C1\",\"occurred_at\":\"$(AT 600)\"}"; echo
+  -d "{\"scan_no\":\"S1\",\"chip\":\"CHIP-A\",\"point\":\"C1\",\"occurred_at\":\"$(AT 300)\"}"; echo
 
 echo "## idempotent replay (HTTP 200, replayed=true)"
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$RACE_ID/scans" \
   -H 'Content-Type: application/json' \
-  -d "{\"scan_no\":\"S1\",\"chip\":\"CHIP-A\",\"point\":\"C1\",\"occurred_at\":\"$(AT 600)\"}"
+  -d "{\"scan_no\":\"S1\",\"chip\":\"CHIP-A\",\"point\":\"C1\",\"occurred_at\":\"$(AT 300)\"}"
 
 echo "## conflicting replay (HTTP 409)"
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$RACE_ID/scans" \
   -H 'Content-Type: application/json' \
   -d "{\"scan_no\":\"S1\",\"chip\":\"CHIP-A\",\"point\":\"C1\",\"occurred_at\":\"$(AT 601)\"}"
 
-echo "## provisional results"
+echo "## provisional results (DNF: the second leg exceeds the segment max)"
+curl -fsS "$BASE_URL/races/$RACE_ID/results"; echo
+
+echo "## point clock offsets (unset reads zero; non-integer rejected)"
+curl -fsS "$BASE_URL/races/$RACE_ID/points/C1/offset"; echo
+curl -sS -o /dev/null -w 'fractional offset -> %{http_code}\n' -X PUT \
+  "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 1.5}'
+
+echo "## C1 clock is 360s slow: +360 calibrates 5m -> 11m; the second leg becomes 1740s"
+curl -fsS -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 360}'; echo
+curl -fsS "$BASE_URL/races/$RACE_ID/offsets"; echo
 curl -fsS "$BASE_URL/races/$RACE_ID/results"; echo
 
 echo "## revoke a scan"
 curl -fsS -X DELETE "$BASE_URL/races/$RACE_ID/scans/S2"; echo
 
-echo "## seal (snapshot frozen; later submit/revoke get 409)"
+echo "## seal (snapshot frozen; later submit/revoke/offset change get 409)"
 curl -fsS -X POST "$BASE_URL/races/$RACE_ID/seal"; echo
+curl -sS -o /dev/null -w 'offset change after seal -> %{http_code}\n' -X PUT \
+  "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": -60}'
