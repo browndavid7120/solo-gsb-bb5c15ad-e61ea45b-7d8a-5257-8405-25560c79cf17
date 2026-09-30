@@ -16,7 +16,12 @@ The script walks through every requirement:
   4. provisional results: earliest valid finish, lex-min scan-no tiebreak,
      did-not-finish cases
   5. revoke a scan before sealing -> provisional result recomputed
-  6. seal the race -> frozen snapshot; afterwards submit/revoke are rejected
+  6. per-point clock offsets: query (unset -> 0), set/replace signed
+     integer seconds, immediate provisional recompute from the same
+     committed scans; raw occurred_at kept, calibrated_at shown; non-integer
+     / unknown point / sealed races rejected
+  7. seal the race -> frozen snapshot (offsets included); afterwards
+     submit/revoke/offset change are rejected
 """
 
 from __future__ import annotations
@@ -295,7 +300,165 @@ def main() -> None:
     expect(404, status, "unknown scan revocation 404")
 
     # ------------------------------------------------------------------ #
-    step("6. Seal the race and verify the frozen snapshot")
+    step("6. Per-point clock offsets")
+    # ------------------------------------------------------------------ #
+    # A dedicated race makes the offset arithmetic easy to follow.
+    status, off_race_body = request(
+        "POST",
+        "/races",
+        {
+            "name": "Clock offset demo",
+            "start_time": at(0),
+            "cutoff_time": at(60),
+            "points": [
+                {"code": "C1", "name": "Checkpoint 1"},
+                {"code": "FIN", "name": "Finish", "is_finish": True},
+            ],
+            "segments": [
+                {"min_seconds": 300, "max_seconds": 3600},
+                {"min_seconds": 300, "max_seconds": 3600},
+            ],
+            "runners": [
+                {"bib": "E01", "name": "Eve", "chip": "CHIP-E"},
+            ],
+        },
+    )
+    expect(201, status, "offset demo race created")
+    orp = f"/races/{off_race_body['id']}"
+
+    # No offset configured yet -> every point reports 0.
+    status, body = request("GET", f"{orp}/offsets")
+    show(status, body)
+    expect(200, status, "list offsets")
+    assert body["offset_version"] == 0
+    assert [(o["point"], o["offset_seconds"], o["configured"]) for o in body["offsets"]] == [
+        ("C1", 0, False), ("FIN", 0, False),
+    ]
+    print("ok unset offsets read back as zero")
+
+    # Scans: C1 at raw minute 10, FIN at raw minute 61 -- the raw finish is
+    # one minute past the cutoff, so Eve is DNF before calibration.
+    def oscan(scan_no, point, minute, second=0):
+        return request(
+            "POST",
+            f"{orp}/scans",
+            {
+                "scan_no": scan_no,
+                "chip": "CHIP-E",
+                "point": point,
+                "occurred_at": at(minute, second),
+            },
+        )
+
+    status, _ = oscan("E-010", "C1", 10)
+    expect(201, status, "Eve C1 scan")
+    status, _ = oscan("E-061", "FIN", 61)
+    expect(201, status, "Eve FIN scan (raw minute 61, after cutoff)")
+
+    status, body = request("GET", f"{orp}/results")
+    assert body["results"][0]["status"] == "did_not_finish"
+    print("ok raw finish after cutoff -> DNF")
+
+    # Set FIN's device to -60 s (clock runs fast): calibrated finish is
+    # minute 60, exactly at the cutoff -> finished.
+    status, body = request(
+        "PUT", f"{orp}/points/FIN/offset", {"offset_seconds": -60}
+    )
+    show(status, body)
+    expect(200, status, "set FIN offset -60")
+    assert body["offset_version"] == 1
+    item = body["offsets"][0]
+    assert item["point"] == "FIN" and item["offset_seconds"] == -60
+    assert item["configured"] is True and item["replaced"] is False
+    print("ok first set reports replaced=false and bumps offset_version")
+
+    status, body = request("GET", f"{orp}/results")
+    show(status, body)
+    expect(200, status, "results recomputed after offset change")
+    assert body["offset_version"] == 1
+    row = body["results"][0]
+    assert row["status"] == "finished"
+    finish_used = [u for u in row["used_scans"] if u["point"] == "FIN"][0]
+    # Raw scan time is preserved; calibrated time and totals are shifted.
+    assert finish_used["occurred_at"] == at(61)
+    assert finish_used["calibrated_at"] == at(60)
+    assert finish_used["offset_seconds"] == -60
+    assert row["finish_time"] == at(60)
+    assert row["total_seconds"] == 3600.0
+    print("ok provisional result immediately uses the new offset; raw kept")
+
+    # Replace the offset (same endpoint, new value) -> replaced=true, another
+    # version bump; calibrated minute 59 changes total/rank data immediately.
+    status, body = request(
+        "PUT", f"{orp}/points/FIN/offset", {"offset_seconds": -120}
+    )
+    expect(200, status, "replace FIN offset -120")
+    assert body["offset_version"] == 2
+    assert body["offsets"][0]["replaced"] is True
+    status, body = request("GET", f"{orp}/results")
+    assert body["offset_version"] == 2
+    assert body["results"][0]["finish_time"] == at(59)
+    print("ok replacing an offset bumps the version and recomputes again")
+
+    # Non-integer offsets are explicitly refused (pydantic strict int -> 422).
+    for bad in (1.5, "2", True):
+        status, body = request(
+            "PUT", f"{orp}/points/C1/offset", {"offset_seconds": bad}
+        )
+        show(status, body)
+        expect(422, status, f"non-integer offset {bad!r} rejected")
+
+    # Unknown point / unknown race -> 404.
+    status, body = request(
+        "PUT", f"{orp}/points/NOPE/offset", {"offset_seconds": 1}
+    )
+    show(status, body)
+    expect(404, status, "unknown point offset rejected")
+
+    status, body = request(
+        "PUT",
+        "/races/00000000-0000-0000-0000-000000000000/points/C1/offset",
+        {"offset_seconds": 1},
+    )
+    expect(404, status, "unknown race offset rejected")
+
+    # Listing again still shows the committed values (-120 at FIN, 0 at C1).
+    status, body = request("GET", f"{orp}/offsets")
+    assert {o["point"]: o["offset_seconds"] for o in body["offsets"]} == {
+        "C1": 0, "FIN": -120
+    }
+    print("ok offset query returns current per-point values")
+
+    # Seal this race; its snapshot freezes the calibrated results.
+    status, sealed_off = request("POST", f"{orp}/seal")
+    expect(200, status, "offset race sealed")
+    assert sealed_off["offset_version"] == 2
+    snap_finish = [
+        u for r in sealed_off["results"] for u in r["used_scans"]
+        if u["point"] == "FIN"
+    ][0]
+    assert snap_finish["occurred_at"] == at(61)
+    assert snap_finish["calibrated_at"] == at(59)
+    print("ok sealed snapshot keeps raw times and calibrated times")
+
+    # After sealing: offset changes rejected; the snapshot stays as frozen.
+    status, body = request(
+        "PUT", f"{orp}/points/FIN/offset", {"offset_seconds": 0}
+    )
+    show(status, body)
+    expect(409, status, "offset change after sealing rejected")
+
+    status, body = request("GET", f"{orp}/results")
+    assert body["offset_version"] == 2
+    assert body["results"][0]["finish_time"] == at(59)
+    print("ok sealed results are unaffected by later requests")
+
+    # The offset query still works on a sealed race (read-only).
+    status, body = request("GET", f"{orp}/offsets")
+    expect(200, status, "offset query still allowed after sealing")
+
+    # ------------------------------------------------------------------ #
+    step("7. Seal the main race and verify the frozen snapshot")
     # ------------------------------------------------------------------ #
     status, sealed = request("POST", f"{rp}/seal")
     show(status, sealed)

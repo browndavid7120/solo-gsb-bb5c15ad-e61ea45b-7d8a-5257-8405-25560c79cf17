@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 from . import service
 from .database import SessionLocal, init_db
 from .schemas import (
+    ClockOffsetIn,
+    ClockOffsetListOut,
     ErrorBody,
     RaceCreate,
     RaceOut,
@@ -37,7 +39,8 @@ app = FastAPI(
     lifespan=lifespan,
     description=(
         "Race configuration, out-of-order chip scan ingestion with "
-        "idempotent replay/conflict detection, provisional results, scan "
+        "idempotent replay/conflict detection, per-point signed integer "
+        "clock offsets, provisional results on calibrated times, scan "
         "revocation and sealing of a frozen result snapshot."
     ),
 )
@@ -141,6 +144,40 @@ def revoke_scan(
 ) -> dict:
     scan = service.revoke_scan(db, race_id, scan_no)
     return service.serialize_scan(scan)
+
+
+# --------------------------------------------------------------------------
+# Clock offsets
+# --------------------------------------------------------------------------
+
+
+@app.get(
+    "/races/{race_id}/offsets",
+    response_model=ClockOffsetListOut,
+    tags=["clock-offsets"],
+    responses={404: {"model": ErrorBody}},
+)
+def list_clock_offsets(race_id: str, db: Session = Depends(get_db)) -> dict:
+    return service.list_offsets(db, race_id)
+
+
+@app.put(
+    "/races/{race_id}/points/{point_code}/offset",
+    response_model=ClockOffsetListOut,
+    tags=["clock-offsets"],
+    responses={
+        404: {"model": ErrorBody},
+        409: {"model": ErrorBody},
+        422: {"model": ErrorBody},
+    },
+)
+def put_clock_offset(
+    race_id: str,
+    point_code: str,
+    payload: ClockOffsetIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    return service.set_point_offset(db, race_id, point_code, payload)
 
 
 # --------------------------------------------------------------------------

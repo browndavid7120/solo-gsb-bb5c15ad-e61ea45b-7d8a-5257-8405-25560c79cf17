@@ -115,6 +115,12 @@ class ScanBatchCreate(BaseModel):
     scans: list[ScanCreate] = Field(..., min_length=1)
 
 
+class ClockOffsetIn(BaseModel):
+    # Strict int: 1.5 / 1.0 / "2" / true are all rejected (422), so a
+    # non-integer offset can never be stored.
+    offset_seconds: int = Field(strict=True)
+
+
 # --------------------------------------------------------------------------
 # Outputs
 # --------------------------------------------------------------------------
@@ -152,6 +158,7 @@ class RaceOut(BaseModel):
     sealed: bool
     created_at: datetime
     sealed_at: Optional[datetime]
+    offset_version: int
     points: list[PointOut]
     segments: list[SegmentOut]
     runners: list[RunnerOut]
@@ -161,7 +168,9 @@ class UsedScanOut(BaseModel):
     segment: int
     point: str
     scan_no: str
-    occurred_at: datetime
+    occurred_at: datetime  # raw device timestamp as submitted
+    calibrated_at: datetime  # occurred_at + point clock offset
+    offset_seconds: int
     segment_seconds: float
 
 
@@ -191,6 +200,20 @@ class ScanBatchItem(BaseModel):
     error: Optional[str] = None
     detail: Optional[str] = None
     scan: Optional[ScanOut] = None
+
+
+class ClockOffsetOut(BaseModel):
+    point: str
+    offset_seconds: int  # 0 when never set
+    configured: bool
+    updated_at: Optional[datetime] = None
+    replaced: bool = False
+
+
+class ClockOffsetListOut(BaseModel):
+    race_id: str
+    offset_version: int
+    offsets: list[ClockOffsetOut]
 
 
 class ErrorBody(BaseModel):

@@ -56,8 +56,32 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$RACE_ID/scan
 echo "## provisional results"
 curl -fsS "$BASE_URL/races/$RACE_ID/results"; echo
 
+echo "## clock offsets: all points read zero before configuration"
+curl -fsS "$BASE_URL/races/$RACE_ID/offsets"; echo
+
+echo "## set C1 device offset to +5 signed integer seconds (200, replaced=false)"
+curl -fsS -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 5}'; echo
+
+echo "## replace it with -3 (200, replaced=true); provisional results recompute"
+curl -fsS -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": -3}'; echo
+
+echo "## non-integer offset is refused (HTTP 422)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT \
+  "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 1.5}'
+
+echo "## results now carry occurred_at plus calibrated_at/offset_seconds"
+curl -fsS "$BASE_URL/races/$RACE_ID/results"; echo
+
 echo "## revoke a scan"
 curl -fsS -X DELETE "$BASE_URL/races/$RACE_ID/scans/S2"; echo
 
-echo "## seal (snapshot frozen; later submit/revoke get 409)"
+echo "## seal (snapshot frozen; later submit/revoke/offset change get 409)"
 curl -fsS -X POST "$BASE_URL/races/$RACE_ID/seal"; echo
+
+echo "## offset change after sealing (HTTP 409)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT \
+  "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 0}'

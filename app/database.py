@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     UniqueConstraint,
@@ -62,6 +63,11 @@ class Race(Base):
     sealed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Bumped on every accepted per-point clock-offset change; provisional
+    # results are recomputed against the same committed scans/offset version.
+    offset_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     points: Mapped[list["Point"]] = relationship(
         back_populates="race",
@@ -80,6 +86,9 @@ class Race(Base):
         back_populates="race", cascade="all, delete-orphan"
     )
     snapshots: Mapped[list["ResultSnapshot"]] = relationship(
+        back_populates="race", cascade="all, delete-orphan"
+    )
+    clock_offsets: Mapped[list["ClockOffset"]] = relationship(
         back_populates="race", cascade="all, delete-orphan"
     )
 
@@ -101,6 +110,37 @@ class Point(Base):
     __table_args__ = (
         UniqueConstraint("race_id", "position", name="uq_point_race_position"),
         UniqueConstraint("race_id", "code", name="uq_point_race_code"),
+    )
+
+
+class ClockOffset(Base):
+    """Signed integer-second clock offset for one (race, point) device.
+
+    Only present once staff has set an offset; an absent row means zero.
+    Frozen at sealing together with the result snapshots.
+    """
+
+    __tablename__ = "clock_offsets"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    race_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("races.id", ondelete="CASCADE"), nullable=False
+    )
+    point_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("race_points.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    offset_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    race: Mapped[Race] = relationship(back_populates="clock_offsets")
+    point: Mapped[Point] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("race_id", "point_id", name="uq_offset_race_point"),
     )
 
 

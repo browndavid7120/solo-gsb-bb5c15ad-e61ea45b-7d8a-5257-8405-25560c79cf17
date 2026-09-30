@@ -15,8 +15,17 @@ from sqlalchemy.orm import Session, selectinload
 from .adjudication import Scan as DomainScan
 from .adjudication import Segment as DomainSegment
 from .adjudication import adjudicate_runner
-from .database import Point, Race, ResultSnapshot, Runner, Scan, SegmentRow, utcnow
-from .schemas import RaceCreate, ScanCreate
+from .database import (
+    ClockOffset,
+    Point,
+    Race,
+    ResultSnapshot,
+    Runner,
+    Scan,
+    SegmentRow,
+    utcnow,
+)
+from .schemas import ClockOffsetIn, RaceCreate, ScanCreate
 
 
 class ApiError(Exception):
@@ -67,6 +76,7 @@ def serialize_race(race: Race) -> dict:
         "sealed": race.sealed,
         "created_at": race.created_at,
         "sealed_at": race.sealed_at,
+        "offset_version": race.offset_version or 0,
         "points": [
             {
                 "position": p.position,
@@ -196,10 +206,25 @@ def create_race(db: Session, payload: RaceCreate) -> Race:
 
 
 def get_race_locked(db: Session, race_id: str) -> Race:
-    """Race row with SELECT ... FOR UPDATE (serialises scan/seal/withdraw)."""
+    """Race row with SELECT ... FOR UPDATE (serialises every mutating op).
+
+    The lock serialises scan submit/revoke, offset changes and sealing with
+    each other; point/segment/runner/offset collections are eager-loaded so
+    adjudication and offset listing are consistent under the same lock.
+    """
 
     race_id = _valid_uuid(race_id, what="race_id")
-    race = db.get(Race, race_id, with_for_update=True)
+    race = db.get(
+        Race,
+        race_id,
+        with_for_update=True,
+        options=[
+            selectinload(Race.points),
+            selectinload(Race.segments),
+            selectinload(Race.runners),
+            selectinload(Race.clock_offsets),
+        ],
+    )
     if race is None:
         raise ApiError(404, "race_not_found", f"race {race_id} does not exist")
     return race
@@ -460,6 +485,8 @@ def _runner_results(
     points = sorted(race.points, key=lambda p: p.position)
     point_by_id = {p.id: p for p in points}
     position_by_id = {p.id: p.position for p in points}
+    # Per-point signed integer-second clock offsets; an absent row is zero.
+    offset_by_point_id = {o.point_id: int(o.offset_seconds) for o in race.clock_offsets}
     segments = [
         DomainSegment(
             position=s.position,
@@ -488,6 +515,9 @@ def _runner_results(
                 scan_no=s.scan_no,
                 point_position=position_by_id[s.point_id],
                 occurred_at=s.occurred_at,
+                # Raw occurred_at is preserved; the offset only shifts the
+                # calibrated time used for adjudication.
+                offset_seconds=offset_by_point_id.get(s.point_id, 0),
             )
             for s in runner_scans
         ]
@@ -503,6 +533,8 @@ def _runner_results(
                 "point": point_by_scan_no[u.scan_no].code,
                 "scan_no": u.scan_no,
                 "occurred_at": u.occurred_at,
+                "calibrated_at": u.calibrated_at,
+                "offset_seconds": u.offset_seconds,
                 "segment_seconds": u.segment_seconds,
             }
             for u in result.used_scans
@@ -544,32 +576,40 @@ def _runner_results(
     return ordered
 
 
-def live_results(db: Session, race_id: str) -> dict:
-    race = get_race(db, race_id)
-    if race.sealed:
-        return sealed_results_payload(db, race)
+def _live_payload(db: Session, race: Race) -> dict:
+    # The race row is taken FOR UPDATE by the caller, serialising this read
+    # against scan submit/revoke and offset changes, so provisional results
+    # always reflect one committed scans + offset version.
     return {
         "race_id": str(race.id),
         "name": race.name,
         "sealed": False,
         "sealed_at": None,
+        "offset_version": race.offset_version or 0,
         "results": _runner_results(db, race),
     }
 
 
+def live_results(db: Session, race_id: str) -> dict:
+    race = get_race_locked(db, race_id)
+    try:
+        if race.sealed:
+            return sealed_results_payload(db, race)
+        return _live_payload(db, race)
+    finally:
+        db.commit()  # release the FOR UPDATE row lock immediately
+
+
 def runner_result(db: Session, race_id: str, runner_id: str) -> dict:
     runner_id = _valid_uuid(runner_id, what="runner_id")
-    race = get_race(db, race_id)
-    if race.sealed:
-        payload = sealed_results_payload(db, race)
-    else:
-        payload = {
-            "race_id": str(race.id),
-            "name": race.name,
-            "sealed": False,
-            "sealed_at": None,
-            "results": _runner_results(db, race),
-        }
+    race = get_race_locked(db, race_id)
+    try:
+        if race.sealed:
+            payload = sealed_results_payload(db, race)
+        else:
+            payload = _live_payload(db, race)
+    finally:
+        db.commit()  # release the FOR UPDATE row lock immediately
     for item in payload["results"]:
         if item["runner_id"] == runner_id:
             return item
@@ -607,6 +647,7 @@ def seal_race(db: Session, race_id: str) -> dict:
         "name": race.name,
         "sealed": True,
         "sealed_at": sealed_at,
+        "offset_version": race.offset_version or 0,
         "results": _json_safe(results),
     }
 
@@ -623,5 +664,114 @@ def sealed_results_payload(db: Session, race: Race) -> dict:
         "name": race.name,
         "sealed": True,
         "sealed_at": race.sealed_at,
+        # Frozen alongside the snapshots; never changes after sealing.
+        "offset_version": race.offset_version or 0,
         "results": payloads,
     }
+
+
+# --------------------------------------------------------------------------
+# Per-point clock offsets
+# --------------------------------------------------------------------------
+
+
+def _find_point(race: Race, point_code: str) -> Point:
+    for point in race.points:
+        if point.code == point_code:
+            return point
+    raise ApiError(
+        404,
+        "unknown_point",
+        f"point {point_code!r} does not exist in this race",
+    )
+
+
+def _offset_payload(race: Race, *, only: Optional[str] = None) -> dict:
+    """All current per-point offsets (unset -> 0), in point order."""
+
+    offset_by_point_id = {o.point_id: o for o in race.clock_offsets}
+    items: list[dict] = []
+    for point in sorted(race.points, key=lambda p: p.position):
+        if only is not None and point.code != only:
+            continue
+        row = offset_by_point_id.get(point.id)
+        if row is None:
+            items.append(
+                {
+                    "point": point.code,
+                    "offset_seconds": 0,
+                    "configured": False,
+                    "updated_at": None,
+                }
+            )
+        else:
+            items.append(
+                {
+                    "point": point.code,
+                    "offset_seconds": int(row.offset_seconds),
+                    "configured": True,
+                    "updated_at": row.updated_at,
+                }
+            )
+    return {
+        "race_id": str(race.id),
+        "offset_version": race.offset_version or 0,
+        "offsets": items,
+    }
+
+
+def list_offsets(db: Session, race_id: str) -> dict:
+    # Read under the same race lock as the mutations so the listing observes
+    # one committed offset version (the lock itself is read-only here).
+    race = get_race_locked(db, race_id)
+    try:
+        return _offset_payload(race)
+    finally:
+        db.commit()  # release the FOR UPDATE row lock immediately
+
+
+def set_point_offset(
+    db: Session, race_id: str, point_code: str, payload: ClockOffsetIn
+) -> dict:
+    """Set/replace one point's signed integer-second clock offset.
+
+    Serialised via the race row lock with scan submission, revocation and
+    sealing; a new offset version bumps the provisional results immediately.
+    """
+
+    race = get_race_locked(db, race_id)
+    if race.sealed:
+        raise ApiError(409, "race_sealed",
+                       "race is sealed; clock offsets cannot be changed")
+    point = _find_point(race, point_code)
+
+    existing = next(
+        (o for o in race.clock_offsets if o.point_id == point.id), None
+    )
+    now = utcnow()
+    replaced = existing is not None
+    if existing is None:
+        db.add(
+            ClockOffset(
+                race_id=race.id,
+                point_id=point.id,
+                offset_seconds=payload.offset_seconds,
+                updated_at=now,
+            )
+        )
+    else:
+        existing.offset_seconds = payload.offset_seconds
+        existing.updated_at = now
+    # New committed scans + offset version; provisional results are recomputed
+    # by the next results query (there is nothing stored to invalidate).
+    race.offset_version = (race.offset_version or 0) + 1
+    db.commit()
+
+    # Reload under a fresh lock so the response reflects the committed row
+    # (the collection above was not expired with expire_on_commit=False).
+    race = get_race_locked(db, race_id)
+    body = _offset_payload(race, only=point.code)
+    item = body["offsets"][0]
+    item["replaced"] = replaced
+    db.commit()  # release the FOR UPDATE row lock
+    return body
