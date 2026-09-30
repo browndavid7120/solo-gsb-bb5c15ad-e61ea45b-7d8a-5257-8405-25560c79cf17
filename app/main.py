@@ -1,0 +1,169 @@
+"""FastAPI application: road-race split timing adjudication service."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from . import service
+from .database import SessionLocal, init_db
+from .schemas import (
+    ErrorBody,
+    RaceCreate,
+    RaceOut,
+    RunnerResultOut,
+    ScanBatchCreate,
+    ScanBatchItem,
+    ScanCreate,
+    ScanOut,
+)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Creates tables once the database is reachable (retries internally),
+    # giving the one-command Compose boot its "database initialization".
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="Road Race Split Timing Adjudication Service",
+    version="1.0.0",
+    lifespan=lifespan,
+    description=(
+        "Race configuration, out-of-order chip scan ingestion with "
+        "idempotent replay/conflict detection, provisional results, scan "
+        "revocation and sealing of a frozen result snapshot."
+    ),
+)
+
+
+def get_db() -> Iterator[Session]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@app.exception_handler(service.ApiError)
+async def api_error_handler(_: Request, exc: service.ApiError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.error, "detail": exc.detail},
+    )
+
+
+# --------------------------------------------------------------------------
+# Health
+# --------------------------------------------------------------------------
+
+
+@app.get("/health", tags=["meta"])
+def health() -> dict:
+    return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------
+# Races
+# --------------------------------------------------------------------------
+
+
+@app.post(
+    "/races",
+    response_model=RaceOut,
+    status_code=201,
+    tags=["races"],
+    responses={409: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def create_race(payload: RaceCreate, db: Session = Depends(get_db)) -> dict:
+    race = service.create_race(db, payload)
+    return service.serialize_race(race)
+
+
+@app.get("/races/{race_id}", response_model=RaceOut, tags=["races"])
+def get_race(race_id: str, db: Session = Depends(get_db)) -> dict:
+    return service.serialize_race(service.get_race(db, race_id))
+
+
+# --------------------------------------------------------------------------
+# Scans
+# --------------------------------------------------------------------------
+
+
+@app.post(
+    "/races/{race_id}/scans",
+    response_model=ScanOut,
+    tags=["scans"],
+    responses={
+        200: {"model": ScanOut, "description": "idempotent replay"},
+        404: {"model": ErrorBody},
+        409: {"model": ErrorBody},
+    },
+)
+def submit_scan(
+    race_id: str,
+    payload: ScanCreate,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict:
+    scan, replayed = service.submit_scan(db, race_id, payload)
+    response.status_code = 200 if replayed else 201
+    return service.serialize_scan(scan, replayed=replayed)
+
+
+@app.post(
+    "/races/{race_id}/scans/batch",
+    response_model=list[ScanBatchItem],
+    tags=["scans"],
+)
+def submit_scan_batch(
+    race_id: str,
+    payload: ScanBatchCreate,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    return service.submit_scan_batch(db, race_id, payload.scans)
+
+
+@app.delete(
+    "/races/{race_id}/scans/{scan_no}",
+    response_model=ScanOut,
+    tags=["scans"],
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def revoke_scan(
+    race_id: str, scan_no: str, db: Session = Depends(get_db)
+) -> dict:
+    scan = service.revoke_scan(db, race_id, scan_no)
+    return service.serialize_scan(scan)
+
+
+# --------------------------------------------------------------------------
+# Results & sealing
+# --------------------------------------------------------------------------
+
+
+@app.get("/races/{race_id}/results", tags=["results"])
+def race_results(race_id: str, db: Session = Depends(get_db)) -> dict:
+    return service.live_results(db, race_id)
+
+
+@app.get(
+    "/races/{race_id}/runners/{runner_id}/result",
+    response_model=RunnerResultOut,
+    tags=["results"],
+)
+def runner_result(
+    race_id: str, runner_id: str, db: Session = Depends(get_db)
+) -> dict:
+    return service.runner_result(db, race_id, runner_id)
+
+
+@app.post("/races/{race_id}/seal", tags=["results"])
+def seal_race(race_id: str, db: Session = Depends(get_db)) -> dict:
+    return service.seal_race(db, race_id)
